@@ -193,29 +193,50 @@ def parse_args():
     parser.add_argument('--station_lr', type=float, default=0.0001)
 
     # GLAFF + D3A fusion options
-    parser.add_argument('--time_features', type=int, default=7, help='dimension of timestamp features')
-    parser.add_argument('--energy_threshold', type=float, default=0.05, help='virtual drift energy distance threshold')
-    parser.add_argument('--virtual_min_samples', type=int, default=8, help='minimal samples before virtual drift test')
-    parser.add_argument('--residual_base_sigma', type=float, default=0.1, help='baseline std for residual drift check')
-    parser.add_argument('--residual_mu_thresh', type=float, default=3.0, help='multiplier for residual mean drift trigger')
-    parser.add_argument('--residual_sigma_thresh', type=float, default=3.0, help='multiplier for residual std drift trigger')
-    parser.add_argument('--residual_window', type=int, default=20, help='window size for residual drift detection')
-    parser.add_argument('--glaff_buffer_size', type=int, default=64, help='buffer size for glaff fusion')
-    parser.add_argument('--glaff_backbone', type=str, default='ts2vec', help='backbone experiment dispatched for glaff fusion')
-    parser.add_argument('--glaff_ft_lr', type=float, default=1e-3, help='learning rate for local branch fine-tune')
-    parser.add_argument('--glaff_ft_epochs', type=int, default=1, help='epochs for local branch fine-tune')
+    parser.add_argument('--time_features', type=int, default=7,
+                        help='dimension of timestamp features consumed by the GLAFF plugin')
+    parser.add_argument('--energy_threshold', type=float, default=0.05,
+                        help='energy distance threshold that raises the virtual drift alarm')
+    parser.add_argument('--virtual_min_samples', type=int, default=8,
+                        help='minimal batches to collect before running the virtual drift check')
+    parser.add_argument('--residual_base_sigma', type=float, default=0.1,
+                        help='baseline std used to normalize residual-based drift metrics')
+    parser.add_argument('--residual_mu_thresh', type=float, default=3.0,
+                        help='z-score multiplier for the residual mean drift trigger')
+    parser.add_argument('--residual_sigma_thresh', type=float, default=3.0,
+                        help='z-score multiplier for the residual std drift trigger')
+    parser.add_argument('--residual_window', type=int, default=32,
+                        help='window size (in batches) for residual drift detection statistics')
+    parser.add_argument('--glaff_buffer_size', type=int, default=128,
+                        help='max number of samples stored in the FIFO replay buffer for GLAFF-D3A')
+    parser.add_argument('--glaff_backbone', type=str, default='ts2vec',
+                        help='backbone experiment dispatched for glaff_d3a_fusion runs (ts2vec, dlinear, etc.)')
+    parser.add_argument('--glaff_ft_lr', type=float, default=1e-3,
+                        help='learning rate applied to the unfrozen heads during drift-triggered fine-tune')
+    parser.add_argument('--glaff_ft_epochs', type=int, default=1,
+                        help='number of passes over the replay buffer per drift-triggered fine-tune')
 
-    parser.add_argument('--sleep_interval', type=int, default=1, help='latent dimension of koopman embedding')
-    parser.add_argument('--sleep_epochs', type=int, default=1, help='latent dimension of koopman embedding')
-    parser.add_argument('--sleep_kl_pre', type=float, default=0, help='latent dimension of koopman embedding')
-    parser.add_argument('--delay_fb', action='store_true', default=False, help='use delayed feedback')
-    parser.add_argument('--online_adjust', type=float, default=0.0, help='latent dimension of koopman embedding')
-    parser.add_argument('--offline_adjust', type=float, default=0.0, help='latent dimension of koopman embedding')
-    parser.add_argument('--online_adjust_var', type=float, default=0.0, help='latent dimension of koopman embedding')
-    parser.add_argument('--var_weight', type=float, default=0.0, help='latent dimension of koopman embedding')
-    parser.add_argument('--alpha_w', type=float, default=0.0001, help='spectrum filter ratio')
-    parser.add_argument('--alpha_d', type=float, default=0.003, help='spectrum filter ratio')
-    parser.add_argument('--test_lr', type=float, default=0.1, help='spectrum filter ratio')
+    parser.add_argument('--sleep_interval', type=int, default=4,
+                        help='number of buffered batches sampled for each lite adaptation cycle (D3A sleep interval)')
+    parser.add_argument('--sleep_epochs', type=int, default=1,
+                        help='how many gradient steps to run when D3A wakes up for adaptation')
+    parser.add_argument('--sleep_kl_pre', type=float, default=0.0,
+                        help='pre-factor for KL/style regularization losses in D3A variants')
+    parser.add_argument('--delay_fb', action='store_true', default=False, help='enable delayed feedback supervision streams')
+    parser.add_argument('--online_adjust', type=float, default=0.0,
+                        help='weight applied to the online adjustment consistency loss (if enabled)')
+    parser.add_argument('--offline_adjust', type=float, default=0.0,
+                        help='weight applied to offline adjustment / replay consistency losses')
+    parser.add_argument('--online_adjust_var', type=float, default=0.0,
+                        help='scaling factor for the variance branch inside the online adjuster')
+    parser.add_argument('--var_weight', type=float, default=0.0,
+                        help='amplitude of variance-based perturbations injected into replay samples')
+    parser.add_argument('--alpha_w', type=float, default=0.0001,
+                        help='warning-level significance used by the STEPD drift detector')
+    parser.add_argument('--alpha_d', type=float, default=0.003,
+                        help='drift-level significance used by the STEPD drift detector')
+    parser.add_argument('--test_lr', type=float, default=0.1,
+                        help='optional learning rate for test-time optimizers (where supported)')
     args = parser.parse_args()
 
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
