@@ -6,7 +6,15 @@ from layers.Embed import DataEmbedding, DataEmbedding_wo_pos
 from layers.AutoCorrelation import AutoCorrelation, AutoCorrelationLayer
 from layers.FourierCorrelation import FourierBlock, FourierCrossAttention
 from layers.MultiWaveletCorrelation import MultiWaveletCross, MultiWaveletTransform
-from layers.Autoformer_EncDec import Encoder, Decoder, EncoderLayer, DecoderLayer, my_Layernorm, series_decomp, series_decomp_mu
+from layers.Autoformer_EncDec import (
+    Encoder,
+    Decoder,
+    EncoderLayer,
+    DecoderLayer,
+    my_Layernorm,
+    series_decomp,
+    series_decomp_multi,
+)
 from utils.buffer import Buffer
 import math
 import numpy as np
@@ -36,11 +44,12 @@ class ConceptDriftDetector:
         self.loss_history = deque(maxlen=window_size)
         self.reference_history = deque(maxlen=window_size * 10)
 
-    def update_and_check(self, current_loss: float) -> bool:
+    def update_and_check(self, current_loss: float):
+        """Returns (is_drift, z_score)."""
         self.loss_history.append(current_loss)
         if len(self.reference_history) < self.window_size:
             self.reference_history.append(current_loss)
-            return False
+            return False, float('nan')
 
         mu = np.mean(self.reference_history)
         std = np.std(self.reference_history) + 1e-6
@@ -48,10 +57,10 @@ class ConceptDriftDetector:
         z_score = (window_mean - mu) / (std / math.sqrt(len(self.loss_history)))
 
         if z_score > self.threshold:
-            return True
+            return True, z_score
 
         self.reference_history.append(current_loss)
-        return False
+        return False, z_score
 
     def reset_on_drift(self):
         self.loss_history.clear()
@@ -391,7 +400,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
             self._memory_clear()
 
         #for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader): batch_y is the predicted label
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(tqdm(test_loader)):
+        progress = tqdm(test_loader, desc='Test', total=len(test_loader))
+        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(progress):
             pred, true = self._process_one_batch(
                 test_data, batch_x, batch_y, batch_x_mark, batch_y_mark, mode='test')
             preds.append(pred.detach().cpu())
@@ -405,7 +415,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
             if online_enabled:
                 batch_loss = criterion(pred.detach(), true.detach()).item()
-                drift = self.detector.update_and_check(batch_loss)
+                drift, z_score = self.detector.update_and_check(batch_loss)
                 if drift and self._memory_size() >= self.memory_min_batches:
                     self._lite_adaptation(criterion)
                 self._memory_add(
@@ -414,6 +424,20 @@ class Exp_TS2VecSupervised(Exp_Basic):
                     batch_y.float(),
                     batch_y_mark.float()
                 )
+            else:
+                drift, z_score = False, float('nan')
+
+            progress.set_postfix({
+                'MAE': f'{mae:.4f}',
+                'MSE': f'{mse:.4f}',
+                'RMSE': f'{rmse:.4f}',
+                'MAPE': f'{mape:.4f}',
+                'MSPE': f'{mspe:.4f}',
+                'z_score': 'nan' if math.isnan(z_score) else f'{z_score:.2f}',
+                'drift': drift,
+            })
+
+        progress.close()
 
         preds = torch.cat(preds, dim=0).numpy()
         trues = torch.cat(trues, dim=0).numpy()
