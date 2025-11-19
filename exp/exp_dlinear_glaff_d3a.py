@@ -169,7 +169,6 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.adapt_lr = getattr(args, 'glaff_ft_lr', args.learning_rate)
         self.detector = STEPD(new_window_size=detector_window, alpha_w=args.alpha_w, alpha_d=args.alpha_d)
         self._last_online_info = {'drift': False, 'stat': float('nan')}
-        self._lite_adapt_log = None
 
         if args.finetune:
             raise NotImplementedError('Fine-tuning is not supported for the GLAFF-D3A DLinear experiment')
@@ -190,16 +189,6 @@ class Exp_TS2VecSupervised(Exp_Basic):
             logits=batch_x_mark.detach().to(self.device),
             task_labels=batch_y_mark.detach().to(self.device)
         )
-
-    def _log_adaptation_event(self, message):
-        if self._lite_adapt_log is None:
-            log_dir = getattr(self.args, 'checkpoints', './logs')
-            os.makedirs(log_dir, exist_ok=True)
-            log_name = f"{self.args.method}_{self.args.data}_lite_adaptation.out"
-            self._lite_adapt_log = os.path.join(log_dir, log_name)
-        timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-        with open(self._lite_adapt_log, 'a', encoding='utf-8') as log_file:
-            log_file.write(f"[{timestamp}] {message}\n")
 
     def _buffer_sample(self, n_batches):
         size = self._buffer_size()
@@ -534,12 +523,12 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
         if adapt_losses:
             avg_loss = sum(adapt_losses) / len(adapt_losses)
-            self._log_adaptation_event(
+            print(
                 f"[GLAFF-D3A] Lite adaptation triggered: batches={batch_x.shape[0]}, "
                 f"steps={len(adapt_losses)}, loss={avg_loss:.6f}"
             )
         else:
-            self._log_adaptation_event("[GLAFF-D3A] Lite adaptation skipped: no optimization steps executed.")
+            print('[GLAFF-D3A] Lite adaptation skipped: no optimization steps executed.')
 
         self.model.toggle_adaptation_mode(enable=False)
         self.model.eval()
