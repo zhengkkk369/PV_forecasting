@@ -16,6 +16,7 @@ from layers.Autoformer_EncDec import (
     series_decomp_multi,
 )
 from utils.buffer import Buffer
+from utils.detector import STEPD
 import math
 import numpy as np
 from tqdm import tqdm
@@ -29,42 +30,12 @@ import torch
 import torch.nn as nn
 from torch import optim
 from torch.utils.data import DataLoader
-from collections import defaultdict, deque
+from collections import defaultdict
 import os
 import time
 
 import warnings
 warnings.filterwarnings('ignore')
-
-
-class ConceptDriftDetector:
-    def __init__(self, window_size=32, threshold=3.0):
-        self.window_size = window_size
-        self.threshold = threshold
-        self.loss_history = deque(maxlen=window_size)
-        self.reference_history = deque(maxlen=window_size * 10)
-
-    def update_and_check(self, current_loss: float):
-        """Returns (is_drift, z_score)."""
-        self.loss_history.append(current_loss)
-        if len(self.reference_history) < self.window_size:
-            self.reference_history.append(current_loss)
-            return False, float('nan')
-
-        mu = np.mean(self.reference_history)
-        std = np.std(self.reference_history) + 1e-6
-        window_mean = np.mean(self.loss_history)
-        z_score = (window_mean - mu) / (std / math.sqrt(len(self.loss_history)))
-
-        if z_score > self.threshold:
-            return True, z_score
-
-        self.reference_history.append(current_loss)
-        return False, z_score
-
-    def reset_on_drift(self):
-        self.loss_history.clear()
-        self.reference_history.clear()
 
 
 class TS2VecEncoderWrapper(nn.Module):
@@ -189,42 +160,42 @@ class Exp_TS2VecSupervised(Exp_Basic):
         if getattr(args, 'flag', None) != 'Plugin':
             args.flag = 'Plugin'
         self.model = AdaptiveDLinear(args, device=self.device)
-        detector_window = max(4, getattr(args, 'residual_window', 20))
-        detector_threshold = getattr(args, 'residual_mu_thresh', 3.0)
-        self.detector = ConceptDriftDetector(detector_window, detector_threshold)
-        buffer_size = max(4, getattr(args, 'glaff_buffer_size', 64))
-        self.memory = Buffer(buffer_size, self.device, mode='fifo')
-        self.replay_batches = max(1, getattr(args, 'sleep_interval', 4))
-        self.memory_min_batches = max(2, self.replay_batches)
+        self.sleep_interval = max(1, getattr(args, 'sleep_interval', 4))
+        detector_window = max(4, getattr(args, 'residual_window', self.sleep_interval))
+        buffer_capacity = max(self.sleep_interval, getattr(args, 'glaff_buffer_size', 64))
+        self.buffer = Buffer(buffer_capacity, self.device, mode='fifo')
+        self.memory_min_batches = max(2, self.sleep_interval)
         self.adapt_steps = max(1, getattr(args, 'sleep_epochs', 1))
         self.adapt_lr = getattr(args, 'glaff_ft_lr', args.learning_rate)
+        self.detector = STEPD(new_window_size=detector_window, alpha_w=args.alpha_w, alpha_d=args.alpha_d)
+        self._last_online_info = {'drift': False, 'stat': float('nan')}
 
         if args.finetune:
             raise NotImplementedError('Fine-tuning is not supported for the GLAFF-D3A DLinear experiment')
 
-    def _memory_size(self):
-        if not hasattr(self.memory, 'examples'):
+    def _buffer_size(self):
+        if not hasattr(self.buffer, 'examples'):
             return 0
-        return min(self.memory.num_seen_examples, self.memory.examples.shape[0])
+        return min(self.buffer.num_seen_examples, self.buffer.examples.shape[0])
 
-    def _memory_clear(self):
-        if hasattr(self.memory, 'examples'):
-            self.memory.empty()
+    def _buffer_clear(self):
+        if hasattr(self.buffer, 'examples'):
+            self.buffer.empty()
 
-    def _memory_add(self, x, x_mark, y, y_mark):
-        self.memory.add_data(
+    def _buffer_add(self, x, x_mark, y, y_mark):
+        self.buffer.add_data(
             examples=x.detach().to(self.device),
             labels=x_mark.detach().to(self.device),
             logits=y.detach().to(self.device),
             task_labels=y_mark.detach().to(self.device)
         )
 
-    def _memory_sample(self, n_batches):
-        size = self._memory_size()
+    def _buffer_sample(self, n_batches):
+        size = self._buffer_size()
         if size == 0:
             return None
         n_batches = max(1, min(size, n_batches))
-        samples = self.memory.get_data(n_batches)
+        samples = self.buffer.get_data(n_batches)
         if len(samples) < 4:
             return None
         return samples
@@ -393,13 +364,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
         trues = []
         start = time.time()
         maes,mses,rmses,mapes,mspes = [],[],[],[],[]
-        criterion = self._select_criterion()
-        online_enabled = self.online != 'none'
-        if online_enabled:
-            self.detector.reset_on_drift()
-            self._memory_clear()
+        if self.online != 'none':
+            self.detector.reset()
+            self._buffer_clear()
+            self._last_online_info = {'drift': False, 'stat': float('nan')}
 
-        #for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader): batch_y is the predicted label
         progress = tqdm(test_loader, desc='Test', total=len(test_loader))
         for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(progress):
             pred, true = self._process_one_batch(
@@ -413,19 +382,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
             mapes.append(mape)
             mspes.append(mspe)
 
-            if online_enabled:
-                batch_loss = criterion(pred.detach(), true.detach()).item()
-                drift, z_score = self.detector.update_and_check(batch_loss)
-                if drift and self._memory_size() >= self.memory_min_batches:
-                    self._lite_adaptation(criterion)
-                self._memory_add(
-                    batch_x.float(),
-                    batch_x_mark.float(),
-                    batch_y.float(),
-                    batch_y_mark.float()
-                )
-            else:
-                drift, z_score = False, float('nan')
+            info = getattr(self, '_last_online_info', None)
+            stat = info.get('stat', float('nan')) if info else float('nan')
+            drift = info.get('drift', False) if info else False
 
             progress.set_postfix({
                 'MAE': f'{mae:.4f}',
@@ -433,7 +392,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 'RMSE': f'{rmse:.4f}',
                 'MAPE': f'{mape:.4f}',
                 'MSPE': f'{mspe:.4f}',
-                'z_score': 'nan' if math.isnan(z_score) else f'{z_score:.2f}',
+                'theta': 'nan' if math.isnan(stat) else f'{stat:.2f}',
                 'drift': drift,
             })
 
@@ -452,6 +411,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
         return [mae, mse, rmse, mape, mspe, exp_time], MAE, MSE, preds, trues
 
     def _process_one_batch(self, dataset_object, batch_x, batch_y, batch_x_mark, batch_y_mark, mode='train'):
+        if mode == 'test':
+            return self._ol_one_batch(dataset_object, batch_x, batch_y, batch_x_mark, batch_y_mark)
         batch_x = batch_x.float().to(self.device)
         batch_y = batch_y.float().to(self.device)
         batch_x_mark = batch_x_mark.float().to(self.device)
@@ -468,11 +429,14 @@ class Exp_TS2VecSupervised(Exp_Basic):
     def _ol_one_batch(self,dataset_object, batch_x, batch_y, batch_x_mark, batch_y_mark):
         true = rearrange(batch_y[:, -self.args.pred_len:, :], 'b t d -> b (t d)').float().to(self.device)
         criterion = self._select_criterion()
-
         batch_x = batch_x.float().to(self.device)
         batch_y = batch_y.float().to(self.device)
         batch_x_mark = batch_x_mark.float().to(self.device)
         batch_y_mark = batch_y_mark.float().to(self.device)
+        online_enabled = self.online != 'none'
+        if online_enabled and not hasattr(self, 'opt'):
+            self.opt = self._select_optimizer()
+
         for _ in range(self.n_inner):
             if self.args.use_amp:
                 with torch.cuda.amp.autocast():
@@ -482,17 +446,35 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
             outputs = rearrange(outputs, 'b t d -> b (t d)')
             loss = criterion(outputs, true)
-            loss.backward()
-            self.opt.step()       
-            
-            self.opt.zero_grad()
+
+            if online_enabled:
+                loss.backward()
+                self.opt.step()
+                self.opt.zero_grad()
+
+        drift_flag = False
+        theta_stat = float('nan')
+        if online_enabled:
+            self.detector.add_data(loss.item(), batch_x)
+            self._buffer_add(batch_x.detach(), batch_x_mark.detach(), batch_y.detach(), batch_y_mark.detach())
+            status, _ = self.detector.run_test()
+            theta_stat = getattr(self.detector, 'last_theta', float('nan'))
+            drift_flag = status == 1 and self._buffer_size() >= self.memory_min_batches
+            if drift_flag:
+                self._lite_adaptation(criterion)
+
+        self._last_online_info = {
+            'loss': loss.item(),
+            'drift': drift_flag,
+            'stat': theta_stat,
+        }
 
         f_dim = -1 if self.args.features=='MS' else 0
         batch_y = batch_y[:,-self.args.pred_len:,f_dim:].to(self.device)
-        return outputs, rearrange(batch_y, 'b t d -> b (t d)')
+        return outputs.detach(), rearrange(batch_y, 'b t d -> b (t d)')
 
     def _lite_adaptation(self, criterion):
-        samples = self._memory_sample(self.replay_batches)
+        samples = self._buffer_sample(self.sleep_interval)
         if samples is None:
             return
         batch_x, batch_x_mark, batch_y, batch_y_mark = samples
@@ -519,4 +501,5 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
         self.model.toggle_adaptation_mode(enable=False)
         self.model.eval()
-        self.detector.reset_on_drift()
+        self.detector.reset()
+        self._buffer_clear()

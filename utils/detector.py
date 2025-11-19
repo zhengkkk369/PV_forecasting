@@ -16,6 +16,7 @@ class STEPD:
         self.cnt, self.shift_cnt = 1, 0
         self.data = []
         self.data_visualize = None
+        self.last_theta = float('nan')
 
     def add_data(self, error_rate , x):
         self.cnt += 1
@@ -45,6 +46,7 @@ class STEPD:
     def run_test(self,):
         if len(self.data) < self.new_window_size:
             # Not enough data for comparison
+            self.last_theta = float('nan')
             return 0, None
 
         # Extract the most recent time window and the overall time window
@@ -57,6 +59,7 @@ class STEPD:
         std_dev_overall = np.std(overall_window)
         n = len(self.data)
         theta_stepd = (mean_recent - mean_overall) / (std_dev_overall / np.sqrt(n))
+        self.last_theta = theta_stepd
 
         # Calculate the warning and drift thresholds
         warning_threshold = norm.ppf(1 - self.alpha_w / 2)
