@@ -182,12 +182,12 @@ class Exp_TS2VecSupervised(Exp_Basic):
         if hasattr(self.buffer, 'examples'):
             self.buffer.empty()
 
-    def _buffer_add(self, x, x_mark, y, y_mark):
+    def _buffer_add(self, batch_x, batch_y, batch_x_mark, batch_y_mark):
         self.buffer.add_data(
-            examples=x.detach().to(self.device),
-            labels=x_mark.detach().to(self.device),
-            logits=y.detach().to(self.device),
-            task_labels=y_mark.detach().to(self.device)
+            examples=batch_x.detach().to(self.device),
+            labels=batch_y.detach().to(self.device),
+            logits=batch_x_mark.detach().to(self.device),
+            task_labels=batch_y_mark.detach().to(self.device)
         )
 
     def _buffer_sample(self, n_batches):
@@ -198,7 +198,24 @@ class Exp_TS2VecSupervised(Exp_Basic):
         samples = self.buffer.get_data(n_batches)
         if len(samples) < 4:
             return None
-        return samples
+        batch_x, batch_y, batch_x_mark, batch_y_mark = samples
+        return batch_x, batch_x_mark, batch_y, batch_y_mark
+
+    def _current_theta(self):
+        if not hasattr(self, 'detector') or self.detector is None:
+            return float('nan')
+        history = getattr(self.detector, 'data', None)
+        window = getattr(self.detector, 'new_window_size', None)
+        if history is None or window is None or len(history) < window:
+            return float('nan')
+        recent_window = history[-window:]
+        overall = history
+        std_dev = np.std(overall)
+        if std_dev < 1e-8:
+            return 0.0
+        n = len(overall)
+        theta = (np.mean(recent_window) - np.mean(overall)) / (std_dev / math.sqrt(n))
+        return float(theta)
 
 
     def _get_data(self, flag):
@@ -454,14 +471,17 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
         drift_flag = False
         theta_stat = float('nan')
-        if online_enabled:
+        detection_enabled = self.sleep_interval > 1 or getattr(self.args, 'online_adjust', 0) > 0
+        if detection_enabled:
             self.detector.add_data(loss.item(), batch_x)
-            self._buffer_add(batch_x.detach(), batch_x_mark.detach(), batch_y.detach(), batch_y_mark.detach())
+            self._buffer_add(batch_x.detach(), batch_y.detach(), batch_x_mark.detach(), batch_y_mark.detach())
             status, _ = self.detector.run_test()
-            theta_stat = getattr(self.detector, 'last_theta', float('nan'))
-            drift_flag = status == 1 and self._buffer_size() >= self.memory_min_batches
-            if drift_flag:
+            theta_stat = self._current_theta()
+            if (status == 1 or self.detector.cnt >= 1000) and self.sleep_interval > 1:
+                drift_flag = True
                 self._lite_adaptation(criterion)
+                self.detector.reset()
+                self._buffer_clear()
 
         self._last_online_info = {
             'loss': loss.item(),
@@ -501,5 +521,3 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
         self.model.toggle_adaptation_mode(enable=False)
         self.model.eval()
-        self.detector.reset()
-        self._buffer_clear()
