@@ -7,6 +7,7 @@ from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.metrics import metric, cumavg
 from scipy.stats import norm
 import numpy as np
+import math
 from einops import rearrange
 from collections import OrderedDict, defaultdict
 import time
@@ -80,6 +81,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.count, self.buffer_adjust, self.ema_model = 0, Buffer(256, self.device, mode='fifo'), None
         from utils.detector import STEPD
         self.detector = STEPD(new_window_size=buff_size, alpha_w=args.alpha_w, alpha_d=args.alpha_d)
+        self._last_online_info = {'drift': False, 'stat': float('nan')}
             
         if args.finetune:
             inp_var = 'univar' if args.features == 'S' else 'multivar'
@@ -259,7 +261,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
         trues = []
         start = time.time()
         maes,mses,rmses,mapes,mspes = [],[],[],[],[]
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(tqdm(test_loader)):
+        progress = tqdm(test_loader, desc='Test', dynamic_ncols=True)
+        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(progress):
             pred, true = self._process_one_batch(
                 test_data, batch_x, batch_y, batch_x_mark, batch_y_mark, mode='test')
             preds.append(pred.detach().cpu())
@@ -270,6 +273,22 @@ class Exp_TS2VecSupervised(Exp_Basic):
             rmses.append(rmse)
             mapes.append(mape)
             mspes.append(mspe)
+
+            info = getattr(self, '_last_online_info', None)
+            stat = info.get('stat', float('nan')) if info else float('nan')
+            drift = info.get('drift', False) if info else False
+
+            progress.set_postfix({
+                'MAE': f'{mae:.4f}',
+                'MSE': f'{mse:.4f}',
+                'RMSE': f'{rmse:.4f}',
+                'MAPE': f'{mape:.4f}',
+                'MSPE': f'{mspe:.4f}',
+                'theta': 'nan' if math.isnan(stat) else f'{stat:.2f}',
+                'drift': drift,
+            })
+
+        progress.close()
 
         preds = torch.cat(preds, dim=0).numpy()
         trues = torch.cat(trues, dim=0).numpy()
@@ -398,7 +417,20 @@ class Exp_TS2VecSupervised(Exp_Basic):
         plt.legend()
         plt.savefig('mask.pdf')
         plt.close()
-    
+
+    def _current_theta(self):
+        history = getattr(self.detector, 'data', None)
+        window = getattr(self.detector, 'new_window_size', None)
+        if history is None or window is None or len(history) < window:
+            return float('nan')
+        std_dev = np.std(history)
+        if std_dev < 1e-8:
+            return 0.0
+        recent_window = history[-window:]
+        n = len(history)
+        theta = (np.mean(recent_window) - np.mean(history)) / (std_dev / math.sqrt(n))
+        return float(theta)
+
     def _ol_one_batch(self,dataset_object, batch_x, batch_y, batch_x_mark, batch_y_mark):
         true = rearrange(batch_y, 'b t d -> b (t d)').float().to(self.device)
         criterion = self._select_criterion()
@@ -429,15 +461,30 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
         f_dim = -1 if self.args.features=='MS' else 0
         batch_y = batch_y[:,-self.args.pred_len:,f_dim:].to(self.device)
-        
+
+        drift_flag = False
+        theta_stat = float('nan')
+        detector_loss = float('nan')
         if self.sleep_interval > 1  or self.args.online_adjust > 0:
-            self.detector.add_data(loss.item(), batch_x)
+            if self.online == 'none':
+                with torch.no_grad():
+                    detector_loss = criterion(outputs.detach(), true.detach()).item()
+            else:
+                detector_loss = loss.item()
+            self.detector.add_data(detector_loss, batch_x)
             self.count += batch_y.size(0)
             self.buffer.add_data(examples = x, labels = batch_y, logits = outputs.data)
             # self.buffer_adjust.add_data(examples = x, labels = batch_y, logits = outputs.data)
             status, name = self.detector.run_test()
+            theta_stat = self._current_theta()
             if (status == 1 or self.detector.cnt >= 1000) and self.sleep_interval > 1:
+                drift_flag = True
                 self.sleep_stage()
                 self.detector.reset()
+        self._last_online_info = {
+            'loss': detector_loss,
+            'drift': drift_flag,
+            'stat': theta_stat,
+        }
         torch.cuda.empty_cache()
         return outputs, rearrange(batch_y, 'b t d -> b (t d)')
