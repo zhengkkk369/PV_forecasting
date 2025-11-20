@@ -193,22 +193,20 @@ def parse_args():
     parser.add_argument('--station_lr', type=float, default=0.0001)
 
     # GLAFF + D3A fusion options
-    parser.add_argument('--time_features', type=int, default=7,
-                        help='dimension of timestamp features consumed by the GLAFF plugin')
-    parser.add_argument('--energy_threshold', type=float, default=0.05,
-                        help='energy distance threshold that raises the virtual drift alarm')
-    parser.add_argument('--virtual_min_samples', type=int, default=8,
-                        help='minimal batches to collect before running the virtual drift check')
+    #parser.add_argument('--energy_threshold', type=float, default=0.05,
+    #                    help='energy distance threshold that raises the virtual drift alarm')
+    #parser.add_argument('--virtual_min_samples', type=int, default=8,
+    #                    help='minimal batches to collect before running the virtual drift check')
     parser.add_argument('--residual_base_sigma', type=float, default=0.1,
                         help='baseline std used to normalize residual-based drift metrics')
     parser.add_argument('--residual_mu_thresh', type=float, default=3.0,
                         help='z-score multiplier for the residual mean drift trigger')
     parser.add_argument('--residual_sigma_thresh', type=float, default=3.0,
-                        help='z-score multiplier for the residual std drift trigger')
+                       help='z-score multiplier for the residual std drift trigger')
     parser.add_argument('--residual_window', type=int, default=32,
                         help='window size (in batches) for residual drift detection statistics')
-    parser.add_argument('--glaff_buffer_size', type=int, default=128,
-                        help='max number of samples stored in the FIFO replay buffer for GLAFF-D3A')
+    #parser.add_argument('--glaff_buffer_size', type=int, default=128,
+    #                    help='max number of samples stored in the FIFO replay buffer for GLAFF-D3A')
     parser.add_argument('--glaff_backbone', type=str, default='ts2vec',
                         help='backbone experiment dispatched for glaff_d3a_fusion runs (ts2vec, dlinear, etc.)')
     parser.add_argument('--glaff_ft_lr', type=float, default=1e-3,
@@ -216,9 +214,9 @@ def parse_args():
     parser.add_argument('--glaff_ft_epochs', type=int, default=1,
                         help='number of passes over the replay buffer per drift-triggered fine-tune')
 
-    parser.add_argument('--sleep_interval', type=int, default=4,
+    parser.add_argument('--sleep_interval', type=int, default=16,
                         help='number of buffered batches sampled for each lite adaptation cycle (D3A sleep interval)')
-    parser.add_argument('--sleep_epochs', type=int, default=1,
+    parser.add_argument('--sleep_epochs', type=int, default=10,
                         help='how many gradient steps to run when D3A wakes up for adaptation')
     parser.add_argument('--sleep_kl_pre', type=float, default=0.0,
                         help='pre-factor for KL/style regularization losses in D3A variants')

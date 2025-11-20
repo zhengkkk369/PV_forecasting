@@ -163,8 +163,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.model = AdaptiveDLinear(args, device=self.device)
         self.sleep_interval = max(1, getattr(args, 'sleep_interval', 4))
         detector_window = max(4, getattr(args, 'residual_window', self.sleep_interval))
-        buffer_capacity = max(self.sleep_interval, getattr(args, 'glaff_buffer_size', 64))
-        self.buffer = Buffer(buffer_capacity, self.device, mode='fifo')
+        buff_size = args.sleep_interval if args.sleep_interval > 0 else 100
+        self.buffer = Buffer(buff_size, self.device, mode='fifo')  # FIFO
         self.memory_min_batches = max(2, self.sleep_interval)
         self.adapt_steps = max(1, getattr(args, 'sleep_epochs', 1))
         self.adapt_lr = getattr(args, 'glaff_ft_lr', args.learning_rate)
@@ -212,8 +212,6 @@ class Exp_TS2VecSupervised(Exp_Basic):
         return batch_x, batch_x_mark, batch_y, logits, batch_y_mark
 
     def _current_theta(self):
-        if not hasattr(self, 'detector') or self.detector is None:
-            return float('nan')
         history = getattr(self.detector, 'data', None)
         window = getattr(self.detector, 'new_window_size', None)
         if history is None or window is None or len(history) < window:
@@ -421,6 +419,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 'MSPE': f'{mspe:.4f}',
                 'theta': 'nan' if math.isnan(stat) else f'{stat:.2f}',
                 'drift': drift,
+                "adapt times": self.detector.shift_cnt,
             })
 
         progress.close()
