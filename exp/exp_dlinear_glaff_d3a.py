@@ -182,12 +182,12 @@ class Exp_TS2VecSupervised(Exp_Basic):
         if hasattr(self.buffer, 'examples'):
             self.buffer.empty()
 
-    def _buffer_add(self, batch_x, batch_y, batch_x_mark, batch_y_mark):
+    def _buffer_add(self, batch_x, batch_y, batch_x_mark, outputs):
+        combined_x = torch.cat([batch_x, batch_x_mark], dim=-1).detach().to(self.device)
         self.buffer.add_data(
-            examples=batch_x.detach().to(self.device),
+            examples=combined_x,
             labels=batch_y.detach().to(self.device),
-            logits=batch_x_mark.detach().to(self.device),
-            task_labels=batch_y_mark.detach().to(self.device)
+            logits=outputs.detach().to(self.device),
         )
 
     def _buffer_sample(self, n_batches):
@@ -196,10 +196,15 @@ class Exp_TS2VecSupervised(Exp_Basic):
             return None
         n_batches = max(1, min(size, n_batches))
         samples = self.buffer.get_data(n_batches)
-        if len(samples) < 4:
+        if len(samples) < 3:
             return None
-        batch_x, batch_y, batch_x_mark, batch_y_mark = samples
-        return batch_x, batch_x_mark, batch_y, batch_y_mark
+        combined_x, batch_y, logits = samples
+        enc_in = getattr(self.args, 'enc_in', None)
+        if enc_in is None:
+            return None
+        batch_x = combined_x[..., :enc_in]
+        batch_x_mark = combined_x[..., enc_in:]
+        return batch_x, batch_x_mark, batch_y, logits
 
     def _current_theta(self):
         if not hasattr(self, 'detector') or self.detector is None:
@@ -474,10 +479,15 @@ class Exp_TS2VecSupervised(Exp_Basic):
         detection_enabled = self.sleep_interval > 1 or getattr(self.args, 'online_adjust', 0) > 0
         if detection_enabled:
             self.detector.add_data(loss.item(), batch_x)
-            self._buffer_add(batch_x.detach(), batch_y.detach(), batch_x_mark.detach(), batch_y_mark.detach())
+            self._buffer_add(batch_x.detach(), batch_y.detach(), batch_x_mark.detach(), outputs.detach())
             status, _ = self.detector.run_test()
             theta_stat = self._current_theta()
-            if (status == 1 or self.detector.cnt >= 1000) and self.sleep_interval > 1:
+            drift_ready = (
+                status == 1
+                and self._buffer_size() >= self.sleep_interval
+            )
+
+            if (drift_ready or self.detector.cnt >= 1000) and self.sleep_interval > 1:
                 drift_flag = True
                 self._lite_adaptation(criterion)
                 self.detector.reset()
@@ -494,41 +504,61 @@ class Exp_TS2VecSupervised(Exp_Basic):
         return outputs.detach(), rearrange(batch_y, 'b t d -> b (t d)')
 
     def _lite_adaptation(self, criterion):
-        samples = self._buffer_sample(self.sleep_interval)
-        if samples is None:
-            return
-        batch_x, batch_x_mark, batch_y, batch_y_mark = samples
-        if batch_x.shape[0] == 0:
+        """Run the D³A light-weight "sleep" stage: freeze the trunk and tune only heads/combiner."""
+        if self._buffer_size() == 0:
             return
 
-        f_dim = -1 if self.args.features == 'MS' else 0
-        target = rearrange(batch_y[:, -self.args.pred_len:, f_dim:], 'b t d -> b (t d)')
+        enc_in = getattr(self.args, 'enc_in', None)
+        if enc_in is None:
+            return
 
+        # Match FSNet's sleep-stage schedule: iterate over a sleep window broken into buffer batches.
+        batch_size = min(self.args.batch_size, self.sleep_interval)
+        steps = max(1, self.sleep_interval // batch_size)
+
+        # Only head/combiner parameters remain trainable during adaptation.
         self.model.toggle_adaptation_mode(enable=True)
-        optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=self.adapt_lr
-        )
+        adapt_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not adapt_params:
+            self.model.toggle_adaptation_mode(enable=False)
+            return
+
+        optimizer = torch.optim.Adam(adapt_params, lr=self.adapt_lr)
 
         self.model.train()
         adapt_losses = []
+        f_dim = -1 if self.args.features == 'MS' else 0
         for _ in range(self.adapt_steps):
-            preds = self.model(batch_x, batch_x_mark, batch_y_mark)
-            preds = rearrange(preds[:, -self.args.pred_len:, f_dim:], 'b t d -> b (t d)')
-            loss = criterion(preds, target)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            adapt_losses.append(loss.item())
+            for _ in range(steps):
+                samples = self.buffer.get_data(batch_size)
+                if len(samples) < 3:
+                    continue
+                combined_x, buff_y, _ = samples
+                if combined_x.shape[0] == 0:
+                    continue
+
+                # Split stored encoder data and time marks back into the original inputs.
+                buff_x = combined_x[..., :enc_in]
+                buff_x_mark = combined_x[..., enc_in:]
+                target = rearrange(buff_y[:, -self.args.pred_len:, f_dim:], 'b t d -> b (t d)')
+
+                preds = self.model(buff_x, buff_x_mark, None)
+                preds = rearrange(preds[:, -self.args.pred_len:, f_dim:], 'b t d -> b (t d)')
+                loss = criterion(preds, target)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                adapt_losses.append(loss.item())
 
         if adapt_losses:
             avg_loss = sum(adapt_losses) / len(adapt_losses)
             print(
-                f"[GLAFF-D3A] Lite adaptation triggered: batches={batch_x.shape[0]}, "
+                f"\n[GLAFF-D3A] Lite adaptation triggered: batches={batch_size}, "
                 f"steps={len(adapt_losses)}, loss={avg_loss:.6f}"
             )
         else:
-            print('[GLAFF-D3A] Lite adaptation skipped: no optimization steps executed.')
+            print('\n[GLAFF-D3A] Lite adaptation skipped: no optimization steps executed.')
 
         self.model.toggle_adaptation_mode(enable=False)
         self.model.eval()
