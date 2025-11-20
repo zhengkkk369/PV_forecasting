@@ -16,6 +16,7 @@ class STEPD:
         self.cnt, self.shift_cnt = 1, 0
         self.data = []
         self.data_visualize = None
+        self.last_theta = float('nan')
 
     def add_data(self, error_rate , x):
         self.cnt += 1
@@ -45,6 +46,7 @@ class STEPD:
     def run_test(self,):
         if len(self.data) < self.new_window_size:
             # Not enough data for comparison
+            self.last_theta = float('nan')
             return 0, None
 
         # Extract the most recent time window and the overall time window
@@ -55,20 +57,27 @@ class STEPD:
         mean_recent = np.mean(recent_window)
         mean_overall = np.mean(overall_window)
         std_dev_overall = np.std(overall_window)
+        if std_dev_overall < 1e-8:
+            # Variance collapsed; treat as no drift and keep detector stable
+            self.last_theta = 0.0
+            return 0, 1e-4
+
         n = len(self.data)
-        theta_stepd = (mean_recent - mean_overall) / (std_dev_overall / np.sqrt(n))
+        theta_stepd = (mean_recent - mean_overall) / (max(std_dev_overall, 1e-8) / np.sqrt(n))
+        self.last_theta = theta_stepd
 
         # Calculate the warning and drift thresholds
         warning_threshold = norm.ppf(1 - self.alpha_w / 2)
         drift_threshold = norm.ppf(1 - self.alpha_d / 2)
 
         # Check for warning or drift
-        if theta_stepd > drift_threshold:
+        abs_theta = abs(theta_stepd)
+        if abs_theta > drift_threshold:
             # self.plt_distribution(self.data, c1 = colors[0], c2 = colors[1])
             # self.plt_distribution(self.data_visualize[:,0].numpy(), name='value', c1 = colors[2], c2 = colors[3])
             return 1, 3e-3
         else:
-            lr = 1e-4 + (3e-3 - 1e-4) * (theta_stepd / drift_threshold)
+            lr = 1e-4 + (3e-3 - 1e-4) * (abs_theta / drift_threshold)
             return 0, max(lr, 1e-4)
 
     def plt_distribution(self, data, name='error', c1 = colors[0], c2 = colors[1]):
