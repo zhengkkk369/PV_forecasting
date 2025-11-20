@@ -182,12 +182,12 @@ class Exp_TS2VecSupervised(Exp_Basic):
         if hasattr(self.buffer, 'examples'):
             self.buffer.empty()
 
-    def _buffer_add(self, batch_x, batch_y, batch_x_mark, batch_y_mark):
+    def _buffer_add(self, batch_x, batch_y, batch_x_mark, outputs):
         combined_x = torch.cat([batch_x, batch_x_mark], dim=-1).detach().to(self.device)
         self.buffer.add_data(
             examples=combined_x,
             labels=batch_y.detach().to(self.device),
-            logits=batch_y_mark.detach().to(self.device),
+            logits=outputs.detach().to(self.device),
         )
 
     def _buffer_sample(self, n_batches):
@@ -198,13 +198,13 @@ class Exp_TS2VecSupervised(Exp_Basic):
         samples = self.buffer.get_data(n_batches)
         if len(samples) < 3:
             return None
-        combined_x, batch_y, batch_y_mark = samples
+        combined_x, batch_y, logits = samples
         enc_in = getattr(self.args, 'enc_in', None)
         if enc_in is None:
             return None
         batch_x = combined_x[..., :enc_in]
         batch_x_mark = combined_x[..., enc_in:]
-        return batch_x, batch_x_mark, batch_y, batch_y_mark
+        return batch_x, batch_x_mark, batch_y, logits
 
     def _current_theta(self):
         if not hasattr(self, 'detector') or self.detector is None:
@@ -479,7 +479,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         detection_enabled = self.sleep_interval > 1 or getattr(self.args, 'online_adjust', 0) > 0
         if detection_enabled:
             self.detector.add_data(loss.item(), batch_x)
-            self._buffer_add(batch_x.detach(), batch_y.detach(), batch_x_mark.detach(), batch_y_mark.detach())
+            self._buffer_add(batch_x.detach(), batch_y.detach(), batch_x_mark.detach(), outputs.detach())
             status, _ = self.detector.run_test()
             theta_stat = self._current_theta()
             drift_ready = (
@@ -507,7 +507,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         samples = self._buffer_sample(self.sleep_interval)
         if samples is None:
             return
-        batch_x, batch_x_mark, batch_y, batch_y_mark = samples
+        batch_x, batch_x_mark, batch_y, _ = samples
         if batch_x.shape[0] == 0:
             return
 
@@ -523,7 +523,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.model.train()
         adapt_losses = []
         for _ in range(self.adapt_steps):
-            preds = self.model(batch_x, batch_x_mark, batch_y_mark)
+            preds = self.model(batch_x, batch_x_mark, None)
             preds = rearrange(preds[:, -self.args.pred_len:, f_dim:], 'b t d -> b (t d)')
             loss = criterion(preds, target)
             optimizer.zero_grad()
