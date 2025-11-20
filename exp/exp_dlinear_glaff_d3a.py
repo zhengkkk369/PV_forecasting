@@ -185,12 +185,14 @@ class Exp_TS2VecSupervised(Exp_Basic):
         if hasattr(self.buffer, 'examples'):
             self.buffer.empty()
 
-    def _buffer_add(self, batch_x, batch_y, batch_x_mark, outputs):
+    def _buffer_add(self, batch_x, batch_y, batch_x_mark, batch_y_mark, outputs):
+        """Cache encoder inputs/marks plus decoder marks for plugin-aware replay."""
         combined_x = torch.cat([batch_x, batch_x_mark], dim=-1).detach().to(self.device)
         self.buffer.add_data(
             examples=combined_x,
             labels=batch_y.detach().to(self.device),
             logits=outputs.detach().to(self.device),
+            task_labels=batch_y_mark.detach().to(self.device),  # reuse task_labels slot for decoder marks
         )
 
     def _buffer_sample(self, n_batches):
@@ -199,15 +201,15 @@ class Exp_TS2VecSupervised(Exp_Basic):
             return None
         n_batches = max(1, min(size, n_batches))
         samples = self.buffer.get_data(n_batches)
-        if len(samples) < 3:
+        if len(samples) < 4:
             return None
-        combined_x, batch_y, logits = samples
+        combined_x, batch_y, logits, batch_y_mark = samples
         enc_in = getattr(self.args, 'enc_in', None)
         if enc_in is None:
             return None
         batch_x = combined_x[..., :enc_in]
         batch_x_mark = combined_x[..., enc_in:]
-        return batch_x, batch_x_mark, batch_y, logits
+        return batch_x, batch_x_mark, batch_y, logits, batch_y_mark
 
     def _current_theta(self):
         if not hasattr(self, 'detector') or self.detector is None:
@@ -482,7 +484,13 @@ class Exp_TS2VecSupervised(Exp_Basic):
         detection_enabled = self.sleep_interval > 1 or getattr(self.args, 'online_adjust', 0) > 0
         if detection_enabled:
             self.detector.add_data(loss.item(), batch_x)
-            self._buffer_add(batch_x.detach(), batch_y.detach(), batch_x_mark.detach(), outputs.detach())
+            self._buffer_add(
+                batch_x.detach(),
+                batch_y.detach(),
+                batch_x_mark.detach(),
+                batch_y_mark.detach(),
+                outputs.detach(),
+            )
             status, _ = self.detector.run_test()
             theta_stat = self._current_theta()
             # Only adapt when theta is finite and genuinely exceeds the drift threshold to avoid noisy wake-ups
@@ -537,9 +545,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
         for _ in range(self.adapt_steps):
             for _ in range(steps):
                 samples = self.buffer.get_data(batch_size)
-                if len(samples) < 3:
+                if len(samples) < 4:
                     continue
-                combined_x, buff_y, _ = samples
+                combined_x, buff_y, _, buff_y_mark = samples
                 if combined_x.shape[0] == 0:
                     continue
 
@@ -548,7 +556,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 buff_x_mark = combined_x[..., enc_in:]
                 target = rearrange(buff_y[:, -self.args.pred_len:, f_dim:], 'b t d -> b (t d)')
 
-                preds = self.model(buff_x, buff_x_mark, None)
+                # Replay with decoder marks so the GLAFF plugin path remains active during adaptation.
+                preds = self.model(buff_x, buff_x_mark, buff_y_mark)
                 preds = rearrange(preds[:, -self.args.pred_len:, f_dim:], 'b t d -> b (t d)')
                 loss = criterion(preds, target)
 
