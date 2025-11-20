@@ -504,37 +504,57 @@ class Exp_TS2VecSupervised(Exp_Basic):
         return outputs.detach(), rearrange(batch_y, 'b t d -> b (t d)')
 
     def _lite_adaptation(self, criterion):
-        samples = self._buffer_sample(self.sleep_interval)
-        if samples is None:
-            return
-        batch_x, batch_x_mark, batch_y, _ = samples
-        if batch_x.shape[0] == 0:
+        """Run the D³A light-weight "sleep" stage: freeze the trunk and tune only heads/combiner."""
+        if self._buffer_size() == 0:
             return
 
-        f_dim = -1 if self.args.features == 'MS' else 0
-        target = rearrange(batch_y[:, -self.args.pred_len:, f_dim:], 'b t d -> b (t d)')
+        enc_in = getattr(self.args, 'enc_in', None)
+        if enc_in is None:
+            return
 
+        # Match FSNet's sleep-stage schedule: iterate over a sleep window broken into buffer batches.
+        batch_size = min(self.args.batch_size, self.sleep_interval)
+        steps = max(1, self.sleep_interval // batch_size)
+
+        # Only head/combiner parameters remain trainable during adaptation.
         self.model.toggle_adaptation_mode(enable=True)
-        optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=self.adapt_lr
-        )
+        adapt_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not adapt_params:
+            self.model.toggle_adaptation_mode(enable=False)
+            return
+
+        optimizer = torch.optim.Adam(adapt_params, lr=self.adapt_lr)
 
         self.model.train()
         adapt_losses = []
+        f_dim = -1 if self.args.features == 'MS' else 0
         for _ in range(self.adapt_steps):
-            preds = self.model(batch_x, batch_x_mark, None)
-            preds = rearrange(preds[:, -self.args.pred_len:, f_dim:], 'b t d -> b (t d)')
-            loss = criterion(preds, target)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            adapt_losses.append(loss.item())
+            for _ in range(steps):
+                samples = self.buffer.get_data(batch_size)
+                if len(samples) < 3:
+                    continue
+                combined_x, buff_y, _ = samples
+                if combined_x.shape[0] == 0:
+                    continue
+
+                # Split stored encoder data and time marks back into the original inputs.
+                buff_x = combined_x[..., :enc_in]
+                buff_x_mark = combined_x[..., enc_in:]
+                target = rearrange(buff_y[:, -self.args.pred_len:, f_dim:], 'b t d -> b (t d)')
+
+                preds = self.model(buff_x, buff_x_mark, None)
+                preds = rearrange(preds[:, -self.args.pred_len:, f_dim:], 'b t d -> b (t d)')
+                loss = criterion(preds, target)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                adapt_losses.append(loss.item())
 
         if adapt_losses:
             avg_loss = sum(adapt_losses) / len(adapt_losses)
             print(
-                f"\n[GLAFF-D3A] Lite adaptation triggered: batches={batch_x.shape[0]}, "
+                f"\n[GLAFF-D3A] Lite adaptation triggered: batches={batch_size}, "
                 f"steps={len(adapt_losses)}, loss={avg_loss:.6f}"
             )
         else:
