@@ -10,3 +10,6 @@ imgs/*
 *.pdf
 *.out
 *.csv
+*.npy
+.vscode/
+.ipynb_checkpoints/
