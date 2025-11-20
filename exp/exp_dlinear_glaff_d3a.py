@@ -491,19 +491,24 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 batch_y_mark.detach(),
                 outputs.detach(),
             )
-            status, _ = self.detector.run_test()
+            status, lr_suggest = self.detector.run_test()
             theta_stat = self._current_theta()
+            detector_window = getattr(self.detector, 'new_window_size', self.sleep_interval)
+            # Require the buffer to hold at least one full detector window to avoid training on too few samples
+            buffer_ready = self._buffer_size() >= max(self.sleep_interval, detector_window)
             # Only adapt when theta is finite and genuinely exceeds the drift threshold to avoid noisy wake-ups
             drift_ready = (
                 status == 1
                 and math.isfinite(theta_stat)
                 and abs(theta_stat) > self._drift_threshold
-                and self._buffer_size() >= self.sleep_interval
+                and buffer_ready
             )
 
             if (drift_ready or self.detector.cnt >= 1000) and self.sleep_interval > 1:
                 drift_flag = True
-                self._lite_adaptation(criterion)
+                # Use the detector-suggested LR when available so adaptation severity follows the detected drift
+                lr_event = lr_suggest if (lr_suggest is not None and not math.isnan(lr_suggest)) else self.adapt_lr
+                self._lite_adaptation(criterion, lr_event)
                 self.detector.reset()
                 self._buffer_clear()
 
@@ -517,7 +522,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         batch_y = batch_y[:,-self.args.pred_len:,f_dim:].to(self.device)
         return outputs.detach(), rearrange(batch_y, 'b t d -> b (t d)')
 
-    def _lite_adaptation(self, criterion):
+    def _lite_adaptation(self, criterion, adapt_lr):
         """Run the D³A light-weight "sleep" stage: freeze the trunk and tune only heads/combiner."""
         if self._buffer_size() == 0:
             return
@@ -537,12 +542,13 @@ class Exp_TS2VecSupervised(Exp_Basic):
             self.model.toggle_adaptation_mode(enable=False)
             return
 
-        optimizer = torch.optim.Adam(adapt_params, lr=self.adapt_lr)
+        optimizer = torch.optim.Adam(adapt_params, lr=adapt_lr)
 
         self.model.train()
         adapt_losses = []
         f_dim = -1 if self.args.features == 'MS' else 0
-        for _ in range(self.adapt_steps):
+        for epoch in range(self.adapt_steps):
+            epoch_losses = []
             for _ in range(steps):
                 samples = self.buffer.get_data(batch_size)
                 if len(samples) < 4:
@@ -565,14 +571,16 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 loss.backward()
                 optimizer.step()
                 adapt_losses.append(loss.item())
+                epoch_losses.append(loss.item())
 
-        if adapt_losses:
-            avg_loss = sum(adapt_losses) / len(adapt_losses)
-            print(
-                f"\n[GLAFF-D3A] Lite adaptation triggered: batches={batch_size}, "
-                f"steps={len(adapt_losses)}, loss={avg_loss:.6f}"
-            )
-        else:
+            if epoch_losses:
+                mean_epoch_loss = sum(epoch_losses) / len(epoch_losses)
+                print(
+                    f"\n[GLAFF-D3A] Lite adaptation epoch {epoch + 1}/{self.adapt_steps}: "
+                    f"steps={len(epoch_losses)}, loss={mean_epoch_loss:.6f}"
+                )
+
+        if not adapt_losses:
             print('\n[GLAFF-D3A] Lite adaptation skipped: no optimization steps executed.')
 
         self.model.toggle_adaptation_mode(enable=False)
